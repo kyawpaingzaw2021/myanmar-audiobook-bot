@@ -14,3 +14,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+bot.py.backup*
+patch_v17.py
