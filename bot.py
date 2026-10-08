@@ -1,6 +1,6 @@
 """
-Myanmar TTS Audiobook Bot (v16 — Stable Release)
-Multi-User + Edge-TTS + ffmpeg Concat + systemd-ready
+Myanmar TTS Audiobook Bot (v17)
+Multi-User + Edge-TTS + ffmpeg + send_audio + separate filename_prefix
 """
 
 import os
@@ -148,6 +148,7 @@ DEFAULT_SETTINGS = {
     "chunk_size": 2000,
     "target_minutes": 45,
     "book_name": "Myanmar Audiobook",
+    "filename_prefix": "",
     "auto_clean": True,
     "channel_id": DEFAULT_CHANNEL_ID,
 }
@@ -215,6 +216,15 @@ def get_user_settings(uid: int) -> dict:
             if merged.get("voice") not in _VALID_VOICES:
                 merged["voice"] = "my-MM-NilarNeural"
                 changed = True
+            fp = merged.get("filename_prefix", "")
+            if not isinstance(fp, str):
+                merged["filename_prefix"] = ""
+                changed = True
+            elif fp:
+                _, fp_clean = sanitize_book(fp)
+                if fp_clean != fp:
+                    merged["filename_prefix"] = fp_clean
+                    changed = True
             try:
                 cs = int(merged.get("chunk_size", 2000))
                 if cs < 500 or cs > 5000:
@@ -905,7 +915,12 @@ async def finalize_batch(context, uid, chat_id, batch_path, state, settings, par
     total_batches = state.get("est_batches", 0)
 
     raw_book = settings.get("book_name", "Myanmar Audiobook")
-    book_md, book_fn = sanitize_book(raw_book)
+    book_md, book_fn_default = sanitize_book(raw_book)
+    fp = (settings.get("filename_prefix") or "").strip()
+    if fp:
+        _, book_fn = sanitize_book(fp)
+    else:
+        book_fn = book_fn_default
 
     channel_id = settings.get("channel_id", "") or DEFAULT_CHANNEL_ID
     posted = False
@@ -984,7 +999,7 @@ async def cleanup_user(uid: int, delete_dir: bool = True):
         except Exception:
             pass
 
-# ==================== MENU BUILDERS ====================
+# ==================== MENUS ====================
 def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📖 အသုံးပြုနည်း", callback_data="m_howto")],
@@ -1041,6 +1056,7 @@ def voice_menu_kb(s: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"🔁 Retry: {s['retry']}", callback_data="v_retry")],
         [InlineKeyboardButton(f"🧹 Auto-clean: {ac}", callback_data="v_autoclean")],
         [InlineKeyboardButton("📚 Book Name", callback_data="v_book")],
+        [InlineKeyboardButton("📁 Filename", callback_data="v_filename")],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="m_main")],
     ])
 
@@ -1354,7 +1370,35 @@ async def setbook_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     md_safe, fn_safe = sanitize_book(name)
     await update.message.reply_text(
         f"✅ Book name: *{md_safe}*\n"
-        f"📁 Filename: `{fn_safe}_part_001.mp3`",
+        f"📁 Default filename: `{fn_safe}_part_001.mp3`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def setfilename_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+    uid = update.effective_user.id
+    s = get_user_settings(uid)
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text(
+            "📁 `/setfilename <name>`\n\n"
+            "ဥပမာ: `/setfilename History_Vol3`\n"
+            "ဖျက်ရန်: `/setfilename clear`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    if name.lower() in ("clear", "none", "-", "reset"):
+        s["filename_prefix"] = ""
+        save_user_settings(uid)
+        await update.message.reply_text("✅ Filename prefix: default (book name)")
+        return
+    _, fn_safe = sanitize_book(name)
+    s["filename_prefix"] = fn_safe
+    save_user_settings(uid)
+    await update.message.reply_text(
+        f"✅ Filename prefix: `{fn_safe}`\n"
+        f"📁 ဖိုင်အမည်: `{fn_safe}_part_001.mp3`",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -1592,12 +1636,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         engine = s.get("engine", "edge").upper()
         voice = s.get("voice", "my-MM-NilarNeural")
         ch = s.get("channel_id") or "(none)"
+        _, fn_default = sanitize_book(s.get("book_name", "Myanmar Audiobook"))
+        fp = (s.get("filename_prefix") or "").strip()
+        if fp:
+            _, fn_actual = sanitize_book(fp)
+        else:
+            fn_actual = fn_default
 
         await msg.edit_text(
             f"📊 *ဖိုင်ခွဲပြီးပါပြီ*\n\n"
             f"🎙️ Engine: *{engine}*\n"
             f"🎤 Voice: `{voice}`\n"
             f"⚡ Rate: `{s.get('rate', '+0%')}`\n"
+            f"📁 Filename: `{fn_actual}`\n"
             f"📡 Channel: `{ch[:30]}`\n\n"
             f"📄 Chunks: *{total:,}*\n"
             f"📝 စာလုံးရေ: *{total_chars:,}*\n"
@@ -1813,11 +1864,30 @@ async def _callback_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=voice_menu_kb(s), parse_mode=ParseMode.MARKDOWN
         )
     elif data == "v_book":
-        md_safe, fn_safe = sanitize_book(s.get("book_name", ""))
+        md_safe, _ = sanitize_book(s.get("book_name", ""))
         await q.edit_message_text(
-            f"📚 Book Name\n\nလက်ရှိ: *{md_safe}*\n"
-            f"📁 Filename: `{fn_safe}_part_001.mp3`\n\n"
+            f"📚 *Book Name (Display)*\n\n"
+            f"လက်ရှိ: *{md_safe}*\n\n"
             f"ပြောင်းရန်: `/setbook <name>`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="m_voice")]]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif data == "v_filename":
+        _, fn_default = sanitize_book(s.get("book_name", ""))
+        fp = (s.get("filename_prefix") or "").strip()
+        if fp:
+            _, fn_actual = sanitize_book(fp)
+            src = "✅ custom"
+        else:
+            fn_actual = fn_default
+            src = "⚠️ book name (default)"
+        await q.edit_message_text(
+            f"📁 *Filename Prefix*\n\n"
+            f"လက်ရှိ: `{fn_actual}`\n"
+            f"Source: {src}\n\n"
+            f"ဖိုင်အမည်: `{fn_actual}_part_001.mp3`\n\n"
+            f"ပြောင်းရန်: `/setfilename <name>`\n"
+            f"ဖျက်ရန်: `/setfilename clear`",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="m_voice")]]),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -2082,6 +2152,7 @@ async def post_init(app: Application):
             BotCommand("failed", "Failed files"),
             BotCommand("voices", "Voice list"),
             BotCommand("setbook", "Book Name"),
+            BotCommand("setfilename", "Filename Prefix"),
             BotCommand("setchannel", "Channel Setting"),
             BotCommand("myid", "သင့် ID ကြည့်"),
             BotCommand("users", "Users Management"),
@@ -2124,6 +2195,7 @@ def main():
     app.add_handler(CommandHandler("cleaning", cleaning_cmd))
     app.add_handler(CommandHandler("voices", voices_cmd))
     app.add_handler(CommandHandler("setbook", setbook_cmd))
+    app.add_handler(CommandHandler("setfilename", setfilename_cmd))
     app.add_handler(CommandHandler("setchannel", setchannel_cmd))
     app.add_handler(CommandHandler("myid", myid_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
